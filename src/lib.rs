@@ -1,12 +1,6 @@
 //!
-//! @TODO: Write a better desc, this sucks
+//! @TODO: Write crate docs
 //!
-//! Atomic Pubsub is created to be a simple _atomic_ pubsub library.
-//! Atomic in the sense that multiple threads/pods should be able to
-//! subscribe to the same queue but only one subscriber will ever execute
-//! any given command published to the underlying queue.
-//!
-
 #![allow(dead_code)]
 
 mod adapters;
@@ -14,10 +8,17 @@ mod adapters;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::hash::Hash;
+use std::sync::Mutex;
+
+pub type ResultBoxedError<T> = Result<T, Box<dyn Error>>;
 
 pub trait Adapter {
     fn new() -> Self;
-    fn recv<R: From<String>>(&mut self) -> Result<Option<(String, R)>, Box<dyn Error>>;
+    fn recv<R: From<String>>(
+        &mut self,
+        clear_internal_queue: Box<dyn FnOnce(&str, usize) -> ResultBoxedError<()>>,
+    ) -> Result<Option<(String, R)>, Box<dyn Error>>;
+    fn clear(&self, device: &str, count: usize);
 }
 
 pub struct AtomicPubsub<R, T, A>
@@ -25,9 +26,11 @@ where
     R: Eq,
     R: PartialEq,
     R: Hash,
+    R: From<String>,
+    A: Adapter,
 {
     adapter: A,
-    commands: HashMap<String, VecDeque<R>>,
+    commands: Mutex<HashMap<String, VecDeque<R>>>,
     resolvers: HashMap<R, Box<dyn Fn() -> T>>,
 }
 
@@ -43,16 +46,35 @@ where
     A: Adapter,
 {
     /// Start listening for incoming commands
-    pub fn listen(&mut self) {
+    pub fn listen(&'static mut self) {
+        // Closure to be executed from within adapter
+        let clear_queue_closure = |device: &str, count: usize| -> ResultBoxedError<()> {
+            let mut commands = self.commands.lock().unwrap();
+            if let Some(queue) = commands.get_mut(device) {
+                if queue.len() - count == 0 {
+                    // Clear entire queue
+                    commands.remove(device);
+                } else {
+                    // Clear executed commands
+                    queue.drain(..count);
+                }
+            }
+            Result::Ok(())
+        };
+
         loop {
-            let res = self.adapter.recv();
+            let res = self.adapter.recv(Box::new(clear_queue_closure));
             if res.is_err() {
-                // Do something about error?
+                // Should catch all errors in recv, including potential
+                // errors from clear_internal_queue closure
+                // @TODO: Handle/log errors?
                 return;
             }
             // Insert command to internal queue
             if let Some((device, cmd)) = res.unwrap() {
                 self.commands
+                    .lock()
+                    .unwrap()
                     .entry(device)
                     .or_insert(VecDeque::with_capacity(5))
                     .push_back(cmd);
@@ -62,10 +84,12 @@ where
 
     /// Execute commands for a specified device
     fn exec(&mut self, device: &str) {
-        if let Some(queue) = self.commands.get(device) {
+        if let Some(queue) = self.commands.lock().unwrap().get(device) {
             queue.iter().for_each(|cmd| {
                 self.resolvers.get(cmd).unwrap()();
             });
+            // Send clear command
+            self.adapter.clear(device, queue.len());
         }
     }
 }
@@ -80,6 +104,11 @@ mod tests {
     enum Resolvers {
         PowerOff,
     }
+    impl From<String> for Resolvers {
+        fn from(_: String) -> Self {
+            Self::PowerOff
+        }
+    }
 
     #[test]
     fn it_kinda_works() {
@@ -89,7 +118,7 @@ mod tests {
         let aps: AtomicPubsub<Resolvers, ReturnType, adapters::redis::RedisAdapter> =
             AtomicPubsub {
                 adapter,
-                commands: HashMap::new(),
+                commands: Mutex::new(HashMap::new()),
                 resolvers: vec![(
                     Resolvers::PowerOff,
                     Box::new(test_resolver) as Box<dyn Fn() -> ReturnType>,
