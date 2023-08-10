@@ -17,7 +17,7 @@ pub trait Adapter {
     fn recv<R: From<String>>(
         &mut self,
         clear_internal_queue: Box<dyn FnOnce(&str, usize) -> ResultBoxedError<()>>,
-    ) -> Result<Option<(String, R)>, Box<dyn Error>>;
+    ) -> ResultBoxedError<Option<(String, R)>>;
     fn clear(&self, device: &str, count: usize);
 }
 
@@ -49,7 +49,7 @@ where
     pub fn listen(&'static mut self) {
         // Closure to be executed from within adapter
         let clear_queue_closure = |device: &str, count: usize| -> ResultBoxedError<()> {
-            let mut commands = self.commands.lock().unwrap();
+            let mut commands = self.commands.lock()?;
             if let Some(queue) = commands.get_mut(device) {
                 if queue.len() - count == 0 {
                     // Clear entire queue
