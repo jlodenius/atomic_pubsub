@@ -1,7 +1,7 @@
 use crate::{Adapter, ResultBoxedError};
 
 use redis::{self, Commands};
-use std::{convert::From, error::Error};
+use std::convert::From;
 
 pub struct RedisAdapter {
     connection: redis::Connection,
@@ -21,10 +21,7 @@ impl Adapter for RedisAdapter {
 
     /// Attempts to receive a message from redis pubsub.
     /// Blocks until a message is received.
-    fn recv<R: From<String>>(
-        &mut self,
-        clear_internal_queue: Box<dyn FnOnce(&str, usize) -> ResultBoxedError<()>>,
-    ) -> Result<Option<(String, R)>, Box<dyn Error>> {
+    fn recv<R: From<String>>(&mut self) -> ResultBoxedError<Option<(String, R)>> {
         let msg = self.connection.as_pubsub().get_message()?;
         let payload: String = msg.get_payload()?;
 
@@ -32,7 +29,6 @@ impl Adapter for RedisAdapter {
             [device, "CLEAR", count] => {
                 // Clear the internal queue
                 let count: usize = count.parse()?;
-                clear_internal_queue(device, count)?;
                 Ok(Option::None)
             }
             [device, command] => {
