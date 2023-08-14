@@ -1,5 +1,5 @@
 //!
-//! @TODO: Write crate docs
+//! Extremely WIP
 //!
 #![allow(dead_code)]
 
@@ -7,83 +7,85 @@ pub mod adapters;
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::hash::Hash;
 use std::sync::Mutex;
 
 // Type aliases
 pub type ResultBoxedError<T> = Result<T, Box<dyn Error>>;
-pub type ThreadSafeFn<T> = Box<dyn Fn() -> T + Send + 'static>;
+pub type ResolverFn<'a, T> = Box<dyn Fn(&str, &mut T) + Send + Sync + 'a>;
 
 pub trait Adapter {
-    fn new() -> Self;
-    fn recv<R: From<String>>(&mut self) -> ResultBoxedError<Option<(String, R)>>;
+    fn recv(&self) -> ResultBoxedError<Option<(String, String, Option<usize>)>>;
     fn clear(&self, device: &str, count: usize);
 }
 
-pub struct AtomicPubsub<R, T, A>
+pub struct AtomicPubsub<'a, A, T>
 where
-    R: Eq,
-    R: PartialEq,
-    R: Hash,
-    R: From<String>,
     A: Adapter,
 {
     adapter: A,
-    commands: Mutex<HashMap<String, VecDeque<R>>>,
-    resolvers: HashMap<R, ThreadSafeFn<T>>,
+    resolvers: HashMap<&'a str, ResolverFn<'a, T>>,
+    commands: Mutex<HashMap<String, VecDeque<String>>>,
 }
 
-/// R: Resolver enum
-/// T: Return type (unnecessary?)
-/// A: Adapter
-impl<R, T, A> AtomicPubsub<R, T, A>
+impl<'a, A, T> AtomicPubsub<'a, A, T>
 where
-    R: Eq,
-    R: PartialEq,
-    R: Hash,
-    R: From<String>,
     A: Adapter,
 {
-    pub fn new(adapter: A, resolvers: HashMap<R, ThreadSafeFn<T>>) -> Self {
-        AtomicPubsub {
+    pub fn new(adapter: A, resolvers: Vec<(&'a str, ResolverFn<'a, T>)>) -> Self {
+        let resolvers = resolvers.into_iter().collect();
+        Self {
             adapter,
-            commands: Mutex::new(HashMap::new()),
             resolvers,
+            commands: Mutex::new(HashMap::new()),
         }
     }
     /// Start listening for incoming commands
-    pub fn listen(&mut self) {
-        // Closure to be executed from within adapter
-
+    pub fn listen(&self) {
+        // @TODO: Run in thread that restarts on panic
         loop {
             let res = self.adapter.recv();
             if res.is_err() {
-                // Should catch all errors in recv, including potential
-                // errors from clear_internal_queue closure
                 // @TODO: Handle/log errors?
                 return;
             }
-            // Insert command to internal queue
-            if let Some((device, cmd)) = res.unwrap() {
-                self.commands
-                    .lock()
-                    .unwrap()
-                    .entry(device)
-                    .or_insert(VecDeque::with_capacity(5))
-                    .push_back(cmd);
+            match res.unwrap() {
+                // Clear internal queue
+                Some((device, _, Some(count))) => {
+                    if let Ok(mut commands) = self.commands.lock() {
+                        if let Some(queue) = commands.get_mut(&device) {
+                            if queue.len() - count == 0 {
+                                commands.remove(&device);
+                            } else {
+                                queue.drain(..count);
+                            }
+                        }
+                    }
+                }
+                // Insert command to internal queue
+                Some((device, cmd, None)) => {
+                    self.commands
+                        .lock()
+                        .unwrap()
+                        .entry(device)
+                        .or_insert(VecDeque::with_capacity(5))
+                        .push_back(cmd);
+                }
+                // Invalid payload, Log smth?
+                _ => {}
             }
         }
     }
 
     /// Execute commands for a specified device
-    fn exec(&mut self, device: &str) {
-        if let Some(queue) = self.commands.lock().unwrap().get(device) {
-            queue.iter().for_each(|cmd| {
-                self.resolvers.get(cmd).unwrap()();
-            });
-            // Send clear command
-            self.adapter.clear(device, queue.len());
-        }
+    pub fn exec(&mut self, device: &str, extra: &mut T) {
+        let guard = self.commands.lock().unwrap();
+        let Some(queue) = guard.get(device) else { return };
+        queue.iter().for_each(|cmd| {
+            let resolver = self.resolvers.get(cmd.as_str()).unwrap();
+            resolver(device, extra);
+        });
+        // Send clear command
+        self.adapter.clear(device, queue.len());
     }
 }
 
@@ -91,33 +93,23 @@ where
 mod tests {
     use super::*;
 
-    type ReturnType = bool;
-
-    #[derive(Eq, Hash, PartialEq)]
-    enum Resolvers {
-        PowerOff,
-    }
-    impl From<String> for Resolvers {
-        fn from(_: String) -> Self {
-            Self::PowerOff
-        }
-    }
-
-    #[test]
-    fn it_kinda_works() {
-        let test_resolver = || true;
-        let adapter = adapters::redis::RedisAdapter::new();
-        let aps = AtomicPubsub::new(
+    #[tokio::test]
+    async fn it_kinda_works() {
+        let adapter = adapters::redis::RedisAdapter::new().await;
+        let aps: AtomicPubsub<_, i32> = AtomicPubsub::new(
             adapter,
-            vec![(
-                Resolvers::PowerOff,
-                Box::new(test_resolver) as ThreadSafeFn<ReturnType>,
-            )]
-            .into_iter()
-            .collect(),
+            vec![
+                (
+                    "POWER_ON",
+                    Box::new(|x, y| print!("POWER_ON ---> {} {}", x, y)),
+                ),
+                (
+                    "POWER_OFF",
+                    Box::new(|x, y| print!("POWER_OFF ---> {} {}", x, y)),
+                ),
+            ],
         );
-
-        let the_resolver = aps.resolvers.get(&Resolvers::PowerOff).unwrap();
-        assert_eq!(the_resolver(), true);
+        let the_resolver = aps.resolvers.get("POWER_OFF").unwrap();
+        assert_eq!(the_resolver("some_device", &mut 5), ());
     }
 }

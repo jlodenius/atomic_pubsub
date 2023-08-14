@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-redis_adapter = ["redis"]
+redis_adapter = ["redis", "tokio", "crossbeam-channel"]
 
 default = ["redis_adapter"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-redis = { version = "0.23.0", features = ["tls-native-tls"], optional = true }
+redis = { version = "^0.23.0", features = ["tokio-comp", "tokio-native-tls", "connection-manager"], optional = true }
+tokio = { version = "^1.31.0", features = ["macros"], optional = true }
+crossbeam-channel = { version = "^0.5.8", optional = true }
